@@ -1,0 +1,214 @@
+`include "proto/type_axi4lite.svh"
+
+module bigger_half #(
+    parameter CNT = 4096
+) (
+    input  [CNT-1:0]       match_in,
+    input  [CNT-1:0][15:0] prio_in,
+    input  [CNT-1:0][11:0] ind_in,
+    output [CNT/2-1:0]       match_out,
+    output [CNT/2-1:0][15:0] prio_out,
+    output [CNT/2-1:0][11:0] ind_out
+);
+    genvar i;
+    parameter LEN = $clog2(CNT);
+
+    wire [CNT/2-1:0] mux;
+    
+    generate
+        for (i=0; i < CNT; i+=2) begin: compare_half
+            assign match_out[i/2] = match_in[i] | match_in[i+1];
+            assign mux[i/2] = (match_in[i] ^ match_in[i+1]) ? match_in[i] : (prio_in[i] >= prio_in[i+1]);
+            assign prio_out[i/2]  = mux[i/2] ? prio_in[i] : prio_in[i+1];
+            assign ind_out[i/2]   = mux[i/2] ? ind_in[i]  : ind_in[i+1];
+        end
+    endgenerate
+endmodule
+
+
+module bigger #(
+    parameter CNT = 4096
+) (
+    input  [CNT-1:0]       match_in,
+    input  [CNT-1:0][15:0] prio_in,
+    input  [CNT-1:0][11:0]  ind_in,
+    output        match_out,
+    output [11:0] ind_out
+);
+    genvar i;
+    parameter LEN = $clog2(CNT);
+
+    wire  [CNT-1:0]       mid_match[LEN-1:0];
+    wire  [CNT-1:0][15:0] mid_prio [LEN-1:0];
+    wire  [CNT-1:0][11:0] mid_ind  [LEN-1:0];
+
+    assign mid_match[0] = match_in;
+    assign mid_prio[0]  = prio_in;
+    assign mid_ind[0]   = ind_in;
+    assign match_out    = mid_match[LEN-1][0];
+    assign ind_out      = mid_ind[LEN-1][0];
+
+    generate
+        for (i=0; i < LEN; i++) begin: half
+            localparam cnt = 1<<(LEN-i);
+            bigger_half #(cnt) u_half (
+                .match_in (mid_match[i][cnt-1:0])    ,
+                .prio_in  (mid_prio[i][cnt-1:0])     ,
+                .ind_in   (mid_ind[i][cnt-1:0])      ,
+                .match_out(mid_match[i+1][cnt/2-1:0]),
+                .prio_out (mid_prio[i+1][cnt/2-1:0]) ,
+                .ind_out  (mid_ind[i+1][cnt/2-1:0])  
+            );
+        end
+    endgenerate
+
+endmodule
+
+
+module tcam #(
+    parameter SET_LEN = 4,
+    parameter WAY_CNT = 64
+) (
+    input clk,
+    input rst,
+
+    axi4lite_if axi4l,
+
+    input  [WAY_CNT-1:0] data_in,
+    output               match_out,
+    output [11:0]        ind_out 
+);
+    parameter SET_CNT = 1<<SET_LEN;
+    parameter SET_MASK = SET_CNT-1;
+    parameter WAY_LEN = $clog2(WAY_CNT);
+    parameter MEM_ALN = ((WAY_CNT*2+16+8) + 31) / 32;
+    parameter MEM_CNT = MEM_ALN * 32;
+    genvar i;
+
+    reg  [SET_CNT*MEM_ALN-1:0][31:0] mem;
+    wire [SET_CNT-1:0][MEM_CNT-1:0] lut;
+    wire [SET_CNT-1:0][WAY_CNT-1:0] data;
+    wire [SET_CNT-1:0][WAY_CNT-1:0] mask;
+    wire [SET_CNT-1:0][15:0]        prio;
+    wire [SET_CNT-1:0][7:0]         tag ;
+    generate
+        for (i=0; i < SET_CNT*MEM_CNT; i+=32) begin: fill_lut
+            localparam low = i % MEM_CNT;
+            assign lut[i/MEM_CNT][low+31:low] = mem[i/32];
+        end
+    endgenerate
+    generate
+        for (i=0; i < SET_CNT; i++) begin: split_lut
+            assign data[i] = lut[i][(WAY_CNT)-1:0];
+            assign mask[i] = lut[i][(WAY_CNT*2)-1:WAY_CNT];
+            assign prio[i] = lut[i][(WAY_CNT*2+16)-1:WAY_CNT*2];
+            assign tag[i]  = lut[i][(WAY_CNT*2+16+8)-1:WAY_CNT*2+16];
+        end
+    endgenerate
+
+    // 初始化无效
+    generate
+        for (i=0; i < SET_CNT; i++) begin: tag_gen
+            always @(posedge clk) if (rst) tag[i] <= 8'h00;
+        end
+    endgenerate
+
+    // axi4lite
+    reg [31:0] waddr, raddr;
+    wire to_write = axi4l.wvalid  & ~axi4l.bready;
+    wire to_read  = axi4l.arvalid & ~axi4l.rready;
+
+    assign axi4l.awready = 1'b1;
+    assign axi4l.wready = 1'b1;
+    assign axi4l.bresp = 2'b00;
+    assign axi4l.arready = 1'b1;
+    assign axi4l.rresp = 2'b00;
+
+    always @(posedge clk) begin
+        axi4l.bvalid <= to_write;
+        axi4l.rvalid <= to_read;
+        if (to_write) waddr <= axi4l.awaddr;
+        if (to_read ) raddr <= axi4l.araddr;
+    end
+
+    always @(posedge clk) begin
+        if (to_write) begin
+            mem[waddr] <= {
+                axi4l.wstrb[3] ? axi4l.wdata[31:24] : mem[waddr][31:24],
+                axi4l.wstrb[2] ? axi4l.wdata[23:16] : mem[waddr][23:16],
+                axi4l.wstrb[1] ? axi4l.wdata[15:8]  : mem[waddr][15:8],
+                axi4l.wstrb[0] ? axi4l.wdata[7:0]   : mem[waddr][7:0]
+            };
+        end
+    end
+
+    always_comb begin
+        // axi4l.rdata = ;
+    end
+
+    // 每项是否匹配
+    wire [SET_CNT-1:0]       match;
+    wire [SET_CNT-1:0][11:0] ind  ;
+    generate
+        for (i=0; i < SET_CNT; i++) begin : match_gen
+            assign match[i] = tag[i][0] & ((data[i] & mask[i]) == (data_in & mask[i]));
+            assign ind[i]   = i;
+        end
+    endgenerate
+
+    // 根据优先级选择
+    bigger #(SET_CNT) u_bigger (
+        .match_in(match),
+        .prio_in(prio),
+        .ind_in(ind),
+        .match_out(match_out),
+        .ind_out(ind_out)
+    );
+
+endmodule
+
+
+module top #(
+    parameter SET_LEN = 8,
+    parameter WAY_CNT = 64
+) (
+    input clock,
+    input rst,
+
+    input  reg        axi4l_arready,
+    output reg        axi4l_arvalid,
+    output reg [31:0] axi4l_araddr,
+    output reg        axi4l_rready,
+    input  reg        axi4l_rvalid,
+    input  reg [1:0]  axi4l_rresp,
+    input  reg [31:0] axi4l_rdata,
+    input  reg        axi4l_awready,
+    output reg        axi4l_awvalid,
+    output reg [31:0] axi4l_awaddr,
+    input  reg        axi4l_wready,
+    output reg        axi4l_wvalid,
+    output reg [31:0] axi4l_wdata,
+    output reg [3:0]  axi4l_wstrb,
+    output reg        axi4l_bready,
+    input  reg        axi4l_bvalid,
+    input  reg [1:0]  axi4l_bresp,
+
+    input  [WAY_CNT-1:0] data_in,
+    output               match_out,
+    output [11:0]        ind_out 
+);
+
+    axi4lite_if axi4l();
+    always_comb begin
+        `AXI4LITE_PACK(axi4l)
+    end
+
+    tcam #(SET_LEN, WAY_CNT) u_tcam(
+        .clk(clock),
+        .rst(rst),
+        .axi4l(axi4l),
+        .data_in(data_in),
+        .match_out(match_out),
+        .ind_out(ind_out)
+    );
+endmodule
